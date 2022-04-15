@@ -12,9 +12,11 @@ func TestHappy(t *testing.T) {
 		n = 4
 		q = 3
 		f = 1
+
+		height = 100 // Vary this see the results change
 	)
 
-	results := make(chan string, n)
+	resultChan := make(chan string, n)
 
 	busIn := make(chan qbft.Msg)
 
@@ -26,7 +28,7 @@ func TestHappy(t *testing.T) {
 			return time.Second
 		},
 		Decide: func(_ qbft.InstanceID, value []byte) {
-			results <- string(value)
+			resultChan <- string(value)
 		},
 		Valid: func(qbft.Msg) bool {
 			return true
@@ -43,18 +45,17 @@ func TestHappy(t *testing.T) {
 		busOuts = append(busOuts, busOut)
 		deps.Receive = busOut
 
-		s, err := qbft.New(deps, qbft.ProcessID(i), 97, []byte(fmt.Sprint(i)))
+		s, err := qbft.New(deps, qbft.ProcessID(i), height, []byte(fmt.Sprint(i)))
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		go func(s *qbft.State, i int) {
 			qbft.Run(s)
-			t.Logf("Run done: %v", i)
 		}(s, i)
 	}
 
-	var resultCount int
+	var results []string
 
 	for {
 		select {
@@ -62,10 +63,10 @@ func TestHappy(t *testing.T) {
 			for _, out := range busOuts {
 				out <- msg
 			}
-		case result := <-results:
-			resultCount++
-			fmt.Printf("🔥!! result=%v\n", result)
-			if resultCount == n {
+		case result := <-resultChan:
+			results = append(results, result)
+			if len(results) == n {
+				t.Logf("Got all results: %v", results)
 				return
 			}
 		}
