@@ -183,7 +183,7 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 	}
 }
 
-// classify return
+// classify returns any rule triggered upon receipt of the last message.
 func classify(d Defs, instance, process int64, msgs []Msg, last Msg) uponRule {
 	// TODO(corver): Figure out how to handle out of sync round messages...
 	switch last.Type {
@@ -242,7 +242,7 @@ func highestPrepared(qrc []Msg) (int64, []byte) { // Algorithm 4.5
 	return pr, pv
 }
 
-func getMinRound(d Defs, msgs []Msg, round int64) int64 {
+func getMinRound(d Defs, msgs []Msg, round int64) int64 { // Algorithm 3.6
 	counts := make(map[int64]int) // map[round]count
 	for _, msg := range filterMsgs(msgs, MsgRoundChange, nil, nil, nil, nil) {
 		if msg.Round <= round {
@@ -328,7 +328,7 @@ func justifyPrePrepare(d Defs, instance int64, msgs []Msg, msg Msg) bool { // Al
 	}
 }
 
-func qrcNoPrepared(qrc []Msg) bool {
+func qrcNoPrepared(qrc []Msg) bool { // Condition J1
 	// ∀(ROUND-CHANGE, λi , round, prj , pvj) ∈ Qrc : prj = ⊥ ∧ prj = ⊥
 	for _, msg := range qrc {
 		if msg.Type != MsgRoundChange {
@@ -341,7 +341,7 @@ func qrcNoPrepared(qrc []Msg) bool {
 	return true
 }
 
-func qrcHighestPrepared(d Defs, all []Msg, qrc []Msg) ([]byte, bool) {
+func qrcHighestPrepared(d Defs, all []Msg, qrc []Msg) ([]byte, bool) { // Condition J2
 	pr, pv := highestPrepared(qrc)
 	if pr == 0 {
 		return nil, false
