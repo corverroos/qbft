@@ -1,189 +1,222 @@
-// Package qbft is a PoC implementation of https://arxiv.org/pdf/2002.03613.pdf.
+// Package qbft is a PoC implementation of the https://arxiv.org/pdf/2002.03613.pdf paper
+// referenced by the QBFT spec https://github.com/ConsenSys/qbft-formal-spec-and-verification.
 package qbft
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"math"
 	"time"
 )
 
-type (
-	ProcessID  int64 // pi
-	InstanceID int64 // λi
+// Transport abstracts the transport layer between processes in the consensus system.
+type Transport struct {
+	// Broadcast sends the message to all other
+	// processes in the system (including this process).
+	Broadcast func(Msg)
 
-	State struct {
-		deps          Deps
-		process       ProcessID
-		instance      InstanceID
-		round         int64
-		preparedRound int64
-		preparedValue []byte
-		inputValue    []byte
-		timer         *time.Timer
-		msgs          []Msg
-	}
+	// Receive returns a stream of messages received
+	// from other processes in the system (including this process).
+	Receive <-chan Msg
+}
 
-	Deps struct {
-		Leader    func(instance InstanceID, round int64) ProcessID
-		Timeout   func(round int64) time.Duration
-		Decide    func(instance InstanceID, value []byte)
-		Valid     func(Msg) bool
-		Quorum    int
-		Faulty    int
-		Broadcast chan<- Msg
-		Receive   <-chan Msg
-	}
+// Defs defines the consensus system parameters that are external to the qbft algorithm.
+// This remains constant across multiple instances of consensus (calls to Run).
+type Defs struct {
+	// IsLeader is a deterministic leader election function.
+	IsLeader func(instance, round, process int64) bool
+	// NewTimer returns a new timer channel and stop function for the round.
+	NewTimer func(round int64) (<-chan time.Time, func())
+	// IsValid validates messages.
+	IsValid func(instance int64, msg Msg) bool
+	// Quorum is the quorum count for the system.
+	Quorum int
+	// Faulty is the maximum faulty process count for the system.
+	Faulty int
+}
 
-	MsgType int64
+//go:generate stringer -type=MsgType
 
-	Msg struct {
-		Type          MsgType
-		Instance      InstanceID
-		Source        ProcessID
-		Round         int64
-		Value         []byte
-		PreparedRound int64
-		PreparedValue []byte
-	}
-
-	Filter struct {
-		Type          *MsgType
-		Source        *ProcessID
-		Round         *int64
-		Value         *[]byte
-		PreparedRound *int64
-		PreparedValue *[]byte
-	}
-
-	UponRules int64
-)
+// MsgType defines the QBFT message types.
+type MsgType int64
 
 const (
 	MsgPrePrepare MsgType = iota + 1
 	MsgPrepare
 	MsgCommit
 	MsgRoundChange
-
-	UponValidPrePrepare UponRules = iota + 1
-	UponQuorumPrepare
-	UponQuorumCommit
-	UponMinRoundChange
-	UponQuorumRoundChange
 )
 
-func New(deps Deps, process ProcessID, instance InstanceID, inputValue []byte) (*State, error) {
+// Msg defines the inter process messages.
+type Msg struct {
+	Type          MsgType
+	Instance      int64
+	Source        int64
+	Round         int64
+	Value         []byte
+	PreparedRound int64
+	PreparedValue []byte
+}
+
+// uponRule defines the event based rules that are triggered when messages are received.
+type uponRule int64
+
+const (
+	uponUnknown uponRule = iota
+	uponValidPrePrepare
+	uponQuorumPrepare
+	uponQuorumCommit
+	uponMinRoundChange
+	uponQuorumRoundChange
+)
+
+// Run returns the consensus decided value (Qcommit) or a context closed error.
+func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inputValue []byte) ([]byte, error) {
 	if inputValue == nil {
 		return nil, errors.New("nil input value not supported")
 	}
 
-	return &State{
-		deps:       deps,
-		process:    process,
-		instance:   instance,
-		round:      1,
-		inputValue: inputValue,
-	}, nil
-}
+	// === Helpers ==
 
-func Run(s *State) {
-	{ // Algorithm 1.11
-		if s.deps.Leader(s.instance, s.round) == s.process {
-			broadcastMsg(s, MsgPrePrepare, s.round, s.inputValue)
-		}
-
-		resetTimer(s)
+	// broadcastMsg broadcasts a non-round-change message.
+	broadcastMsg := func(typ MsgType, round int64, value []byte) {
+		t.Broadcast(Msg{
+			Type:     typ,
+			Instance: instance,
+			Source:   process,
+			Round:    round,
+			Value:    value,
+		})
 	}
 
+	// broadcastRoundChange broadcasts a round-change message.
+	broadcastRoundChange := func(round int64, pr int64, pv []byte) {
+		t.Broadcast(Msg{
+			Type:          MsgRoundChange,
+			Instance:      instance,
+			Source:        process,
+			Round:         round,
+			PreparedRound: pr,
+			PreparedValue: pv,
+		})
+	}
+
+	// === State ===
+
+	var (
+		round         int64  = 1
+		preparedRound int64  = 0
+		preparedValue []byte = nil
+		msgs          []Msg
+		timerChan     <-chan time.Time
+		stopTimer     func()
+	)
+
+	// === Algrithm ===
+
+	{ // Algorithm 1.11
+		if d.IsLeader(instance, round, process) {
+			broadcastMsg(MsgPrePrepare, round, inputValue)
+		}
+
+		timerChan, stopTimer = d.NewTimer(round)
+	}
+
+	// Handle events until finished.
 	for {
 		select {
-		case msg := <-s.deps.Receive:
-			rules, ok := classify(s, msg)
-			if !ok {
+		case msg := <-t.Receive:
+			if !d.IsValid(instance, msg) {
 				continue
 			}
 
-			s.msgs = append(s.msgs, msg)
+			msgs = append(msgs, msg)
 
-			for _, rule := range rules {
-				switch rule {
-				case UponValidPrePrepare: // Algorithm 2.1
-					resetTimer(s)
-					broadcastMsg(s, MsgPrepare, msg.Round, msg.Value)
+			switch classify(d, instance, process, msgs, msg) {
+			case uponValidPrePrepare: // Algorithm 2.1
+				stopTimer()
+				timerChan, stopTimer = d.NewTimer(round)
 
-				case UponQuorumPrepare: // Algorithm 2.4
-					s.preparedRound = msg.Round
-					s.preparedValue = msg.Value
-					broadcastMsg(s, MsgCommit, msg.Round, msg.Value)
+				broadcastMsg(MsgPrepare, msg.Round, msg.Value)
 
-				case UponQuorumCommit: // Algorithm 2.8
-					stopTimer(s)
-					s.deps.Decide(s.instance, msg.Value)
+			case uponQuorumPrepare: // Algorithm 2.4
+				preparedRound = msg.Round
+				preparedValue = msg.Value
+				broadcastMsg(MsgCommit, msg.Round, msg.Value)
 
-					return
+			case uponQuorumCommit: // Algorithm 2.8
+				stopTimer()
 
-				case UponMinRoundChange: // Algorithm 3.5
-					s.round = getMinRound(s)
-					resetTimer(s)
-					broadcastRoundChange(s)
+				return msg.Value, nil
 
-				case UponQuorumRoundChange: // Algorithm 3.11
-					var value []byte
-					if _, pv := highestPrepared(filterMsgs(s.msgs, qrcFilter(s.round))); pv != nil {
-						value = s.inputValue
-					}
-					broadcastMsg(s, MsgPrePrepare, s.round, value)
+			case uponMinRoundChange: // Algorithm 3.5
+				round = getMinRound(d, msgs, round)
+
+				stopTimer()
+				timerChan, stopTimer = d.NewTimer(round)
+
+				broadcastRoundChange(round, preparedRound, preparedValue)
+
+			case uponQuorumRoundChange: // Algorithm 3.11
+				qrc := filterRoundChange(msgs, msg.Round)
+				_, pv := highestPrepared(qrc)
+
+				value := pv
+				if value == nil {
+					value = inputValue
 				}
+
+				broadcastMsg(MsgPrePrepare, round, value)
 			}
-		case <-s.timer.C: // Algorithm 3.1
-			s.round++
-			resetTimer(s)
-			broadcastRoundChange(s)
+		case <-timerChan: // Algorithm 3.1
+			round++
+
+			stopTimer()
+			timerChan, stopTimer = d.NewTimer(round)
+
+			broadcastRoundChange(round, preparedRound, preparedValue)
+		case <-ctx.Done():
+			// Timeout
+			return nil, ctx.Err()
 		}
 	}
 }
 
-func classify(s *State, msg Msg) ([]UponRules, bool) {
-	if s.instance != msg.Instance {
-		return nil, false
-	}
-	if !s.deps.Valid(msg) {
-		return nil, false
-	}
-
+// classify return
+func classify(d Defs, instance, process int64, msgs []Msg, last Msg) uponRule {
 	// TODO(corver): Figure out how to handle out of sync round messages...
-	var (
-		resp    []UponRules
-		inclNew = append([]Msg{msg}, s.msgs...)
-	)
-	switch msg.Type {
+	switch last.Type {
 	case MsgPrePrepare:
-		if justifyPrePrepare(s, msg) {
-			resp = append(resp, UponValidPrePrepare)
+		if justifyPrePrepare(d, instance, msgs, last) {
+			return uponValidPrePrepare
 		}
 	case MsgPrepare:
-		prepareCount := countMsgs(inclNew, Filter{Type: tPtr(MsgPrepare), Round: iPtr(msg.Round), Value: bPtr(msg.Value)})
-		if prepareCount == s.deps.Quorum {
-			resp = append(resp, UponQuorumPrepare)
+		prepareCount := countByRoundAndValue(msgs, MsgPrepare, last.Round, last.Value)
+		if prepareCount == d.Quorum {
+			return uponQuorumPrepare
 		}
 	case MsgCommit:
-		commitCount := countMsgs(inclNew, Filter{Type: tPtr(MsgCommit), Round: iPtr(msg.Round), Value: bPtr(msg.Value)})
-		if commitCount == s.deps.Quorum {
-			resp = append(resp, UponQuorumCommit)
+		commitCount := countByRoundAndValue(msgs, MsgCommit, last.Round, last.Value)
+		if commitCount == d.Quorum {
+			return uponQuorumCommit
 		}
 	case MsgRoundChange:
-		changeCount := countMsgs(inclNew, Filter{Type: tPtr(MsgRoundChange), Round: iPtr(msg.Round)})
-		if changeCount == s.deps.Faulty+1 {
-			resp = append(resp, UponMinRoundChange)
+		changeCount := countByRound(msgs, MsgRoundChange, last.Round)
+		if changeCount == d.Faulty+1 {
+			return uponMinRoundChange
 		}
-		if changeCount == s.deps.Quorum &&
-			s.deps.Leader(s.instance, msg.Round) == s.process &&
-			justifyRoundChange(s, msg) {
-			resp = append(resp, UponQuorumRoundChange)
+
+		if changeCount == d.Quorum &&
+			d.IsLeader(instance, last.Round, process) &&
+			justifyRoundChange(d, msgs, last) {
+			return uponQuorumRoundChange
 		}
+	default:
+		panic("bug: invalid type")
 	}
 
-	return resp, true
+	return uponUnknown
 }
 
 func highestPrepared(qrc []Msg) (int64, []byte) { // Algorithm 4.5
@@ -209,20 +242,18 @@ func highestPrepared(qrc []Msg) (int64, []byte) { // Algorithm 4.5
 	return pr, pv
 }
 
-func getMinRound(s *State) int64 {
-	ri := s.round
-
-	countByRound := make(map[int64]int)
-	for _, msg := range filterMsgs(s.msgs, Filter{Type: tPtr(MsgRoundChange)}) {
-		if msg.Round <= ri {
+func getMinRound(d Defs, msgs []Msg, round int64) int64 {
+	counts := make(map[int64]int) // map[round]count
+	for _, msg := range filterMsgs(msgs, MsgRoundChange, nil, nil, nil, nil) {
+		if msg.Round <= round {
 			continue
 		}
-		countByRound[msg.Round]++
+		counts[msg.Round]++
 	}
 
 	rmin := int64(math.MaxInt64)
-	for round, count := range countByRound {
-		if count < s.deps.Faulty+1 {
+	for round, count := range counts {
+		if count < d.Faulty+1 {
 			continue
 		}
 		if rmin > round {
@@ -231,29 +262,28 @@ func getMinRound(s *State) int64 {
 		rmin = round
 	}
 
-	if rmin <= ri {
+	if rmin <= round {
 		panic("bug: no rmin")
 	}
 
 	return rmin
 }
 
-func justifyRoundChange(s *State, msg Msg) bool { // Algorithm 4.1
+func justifyRoundChange(d Defs, msgs []Msg, msg Msg) bool { // Algorithm 4.1
 	if msg.Type != MsgRoundChange {
 		panic("bug: not a round change message")
 	}
 
-	inclNew := append([]Msg{msg}, s.msgs...)
-	qrc := filterMsgs(inclNew, qrcFilter(msg.Round))
-	if len(qrc) < s.deps.Quorum {
+	qrc := filterRoundChange(msgs, msg.Round)
+	if len(qrc) < d.Quorum {
 		return false
 	}
 
-	if qrcNoPrepared(qrc, msg.Round) {
+	if qrcNoPrepared(qrc) {
 		return true
 	}
 
-	_, ok := qrcHighestPrepared(s, qrc)
+	_, ok := qrcHighestPrepared(d, msgs, qrc)
 	if !ok {
 		return false
 	}
@@ -261,12 +291,12 @@ func justifyRoundChange(s *State, msg Msg) bool { // Algorithm 4.1
 	return true
 }
 
-func justifyPrePrepare(s *State, msg Msg) bool { // Algorithm 4.3
+func justifyPrePrepare(d Defs, instance int64, msgs []Msg, msg Msg) bool { // Algorithm 4.3
 	if msg.Type != MsgPrePrepare {
-		panic("bug: not a preprepare message")
+		panic("bug: not d preprepare message")
 	}
 
-	if s.deps.Leader(s.instance, msg.Round) != msg.Source {
+	if !d.IsLeader(instance, msg.Round, msg.Source) {
 		return false
 	}
 
@@ -278,16 +308,16 @@ func justifyPrePrepare(s *State, msg Msg) bool { // Algorithm 4.3
 		}
 	}
 	{
-		qrc := filterMsgs(s.msgs, qrcFilter(msg.Round))
-		if len(qrc) < s.deps.Quorum {
+		qrc := filterRoundChange(msgs, msg.Round)
+		if len(qrc) < d.Quorum {
 			return false
 		}
 
-		if qrcNoPrepared(qrc, msg.Round) {
+		if qrcNoPrepared(qrc) {
 			return true
 		}
 
-		pv, ok := qrcHighestPrepared(s, qrc)
+		pv, ok := qrcHighestPrepared(d, msgs, qrc)
 		if !ok {
 			return false
 		} else if !bytes.Equal(pv, msg.Value) {
@@ -298,99 +328,69 @@ func justifyPrePrepare(s *State, msg Msg) bool { // Algorithm 4.3
 	}
 }
 
-func qrcNoPrepared(qrc []Msg, round int64) bool {
+func qrcNoPrepared(qrc []Msg) bool {
 	// ∀(ROUND-CHANGE, λi , round, prj , pvj) ∈ Qrc : prj = ⊥ ∧ prj = ⊥
-	f := qrcFilter(round)
-	f.PreparedRound = iPtr(0)
-	f.PreparedValue = bPtr(nil)
-	noPrepared := filterMsgs(qrc, f)
-	return len(noPrepared) == len(qrc)
+	for _, msg := range qrc {
+		if msg.Type != MsgRoundChange {
+			panic("bug: invalid Qrc set")
+		}
+		if msg.PreparedRound != 0 || msg.PreparedValue != nil {
+			return false
+		}
+	}
+	return true
 }
 
-func qrcHighestPrepared(s *State, qrc []Msg) ([]byte, bool) {
+func qrcHighestPrepared(d Defs, all []Msg, qrc []Msg) ([]byte, bool) {
 	pr, pv := highestPrepared(qrc)
 	if pr == 0 {
 		return nil, false
 	}
 
-	prepFilter := Filter{Type: tPtr(MsgPrepare), Round: iPtr(pr), Value: bPtr(pv)}
-	if len(filterMsgs(s.msgs, prepFilter)) < s.deps.Quorum {
+	if countByRoundAndValue(all, MsgPrepare, pr, pv) < d.Quorum {
 		return nil, false
 	}
 
 	return pv, true
 }
 
-func qrcFilter(round int64) Filter {
-	return Filter{Type: tPtr(MsgRoundChange), Round: iPtr(round)}
+func countByRound(msgs []Msg, typ MsgType, round int64) int {
+	return len(filterMsgs(msgs, typ, &round, nil, nil, nil))
 }
 
-func broadcastMsg(s *State, typ MsgType, round int64, value []byte) {
-	s.deps.Broadcast <- Msg{
-		Type:     typ,
-		Instance: s.instance,
-		Source:   s.process,
-		Round:    round,
-		Value:    value,
-	}
+func countByRoundAndValue(msgs []Msg, typ MsgType, round int64, value []byte) int {
+	return len(filterMsgs(msgs, typ, &round, &value, nil, nil))
 }
 
-func broadcastRoundChange(s *State) {
-	s.deps.Broadcast <- Msg{
-		Type:          MsgRoundChange,
-		Instance:      s.instance,
-		Source:        s.process,
-		Round:         s.round,
-		PreparedRound: s.preparedRound,
-		PreparedValue: s.preparedValue,
-	}
+func filterRoundChange(msgs []Msg, round int64) []Msg {
+	return filterMsgs(msgs, MsgRoundChange, &round, nil, nil, nil)
 }
 
-func resetTimer(s *State) {
-	stopTimer(s)
-	s.timer = time.NewTimer(s.deps.Timeout(s.round))
-}
-
-func stopTimer(s *State) {
-	if s.timer == nil {
-		return
-	}
-
-	if !s.timer.Stop() {
-		<-s.timer.C
-	}
-	s.timer = nil
-}
-
-func countMsgs(msgs []Msg, filter Filter) int {
-	return len(filterMsgs(msgs, filter))
-}
-
-func filterMsgs(msgs []Msg, filter Filter) []Msg {
+func filterMsgs(msgs []Msg, typ MsgType, round *int64, value *[]byte, pr *int64, pv *[]byte) []Msg {
 	var resp []Msg
 	for _, msg := range msgs {
 		// Check type
-		if filter.Type != nil && *filter.Type != msg.Type {
+		if typ != msg.Type {
 			continue
 		}
 
 		// Check round
-		if filter.Round != nil && *filter.Round != msg.Round {
+		if round != nil && *round != msg.Round {
 			continue
 		}
 
 		// Check value
-		if filter.Value != nil && !bytes.Equal(*filter.Value, msg.Value) {
+		if value != nil && !bytes.Equal(*value, msg.Value) {
 			continue
 		}
 
 		// Check prepared value
-		if filter.PreparedValue != nil && !bytes.Equal(*filter.PreparedValue, msg.PreparedValue) {
+		if pv != nil && !bytes.Equal(*pv, msg.PreparedValue) {
 			continue
 		}
 
 		// Check prepared value
-		if filter.PreparedRound != nil && *filter.PreparedRound != msg.PreparedRound {
+		if pr != nil && *pr != msg.PreparedRound {
 			continue
 		}
 
@@ -398,15 +398,4 @@ func filterMsgs(msgs []Msg, filter Filter) []Msg {
 	}
 
 	return resp
-}
-
-func tPtr(typ MsgType) *MsgType {
-	return &typ
-}
-
-func iPtr(i int64) *int64 {
-	return &i
-}
-func bPtr(b []byte) *[]byte {
-	return &b
 }

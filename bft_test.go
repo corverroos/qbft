@@ -1,6 +1,7 @@
 package qbft_test
 
 import (
+	"context"
 	"fmt"
 	"github.com/corverroos/qbft"
 	"testing"
@@ -13,54 +14,58 @@ func TestHappy(t *testing.T) {
 		q = 3
 		f = 1
 
-		height = 100 // Vary this see the results change
+		instance = 1 // Vary this see the results change
 	)
+
+	defs := qbft.Defs{
+		IsLeader: func(instance, round int64, process int64) bool {
+			return (instance+round)%n == process
+		},
+		NewTimer: func(round int64) (<-chan time.Time, func()) {
+			timer := time.NewTimer(time.Minute)
+			return timer.C, func() { timer.Stop() }
+		},
+		IsValid: func(instance int64, msg qbft.Msg) bool {
+			return true
+		},
+		Quorum: q,
+		Faulty: f,
+	}
+
+	var receives []chan qbft.Msg
+	broadcast := make(chan qbft.Msg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	resultChan := make(chan string, n)
 
-	busIn := make(chan qbft.Msg)
-
-	deps := qbft.Deps{
-		Leader: func(instance qbft.InstanceID, round int64) qbft.ProcessID {
-			return qbft.ProcessID((int64(instance) + round) % n)
-		},
-		Timeout: func(round int64) time.Duration {
-			return time.Second
-		},
-		Decide: func(_ qbft.InstanceID, value []byte) {
-			resultChan <- string(value)
-		},
-		Valid: func(qbft.Msg) bool {
-			return true
-		},
-		Quorum:    q,
-		Faulty:    f,
-		Broadcast: busIn,
-		Receive:   nil,
-	}
-
-	var busOuts []chan qbft.Msg
-	for i := 0; i < n; i++ {
-		busOut := make(chan qbft.Msg, 1000)
-		busOuts = append(busOuts, busOut)
-		deps.Receive = busOut
-
-		s, err := qbft.New(deps, qbft.ProcessID(i), height, []byte(fmt.Sprint(i)))
-		if err != nil {
-			t.Fatal(err)
+	for i := int64(0); i < n; i++ {
+		receive := make(chan qbft.Msg, 1000)
+		receives = append(receives, receive)
+		trans := qbft.Transport{
+			Broadcast: func(msg qbft.Msg) {
+				broadcast <- msg
+			},
+			Receive: receive,
 		}
 
-		go func(s *qbft.State, i int) {
-			qbft.Run(s)
-		}(s, i)
+		go func(i int64) {
+			result, err := qbft.Run(ctx, defs, trans, instance, i, []byte(fmt.Sprint(i)))
+			if err != nil {
+				t.Fatal(err)
+				return
+			}
+			resultChan <- string(result)
+		}(i)
 	}
 
 	var results []string
 
 	for {
 		select {
-		case msg := <-busIn:
-			for _, out := range busOuts {
+		case msg := <-broadcast:
+			for _, out := range receives {
 				out <- msg
 			}
 		case result := <-resultChan:
