@@ -31,7 +31,7 @@ type Defs struct {
 	// IsValid validates messages.
 	IsValid func(instance int64, msg Msg) bool
 	// LogUponRule allows debug logging of triggered upon rules on message receipt.
-	LogUponRule func(instance, process int64, msg Msg, uponRule string)
+	LogUponRule func(instance, process, round int64, msg Msg, uponRule string)
 	// Quorum is the quorum count for the system.
 	Quorum int
 	// Faulty is the maximum faulty process count for the system.
@@ -143,14 +143,14 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 
 			msgs = append(msgs, msg)
 
-			rule := classify(d, instance, process, msgs, msg)
-			if rule == uponUnknown {
+			rule, ok := classify(d, instance, round, process, msgs, msg)
+			if !ok {
 				continue
 			}
 
-			d.LogUponRule(instance, process, msg, rule.String())
+			d.LogUponRule(instance, process, round, msg, rule.String())
 
-			switch classify(d, instance, process, msgs, msg) {
+			switch rule {
 			case uponValidPrePrepare: // Algorithm 2.1
 				stopTimer()
 				timerChan, stopTimer = d.NewTimer(round)
@@ -185,6 +185,8 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 				}
 
 				broadcastMsg(MsgPrePrepare, round, value)
+			default:
+				panic("bug: invalid rule")
 			}
 		case <-timerChan: // Algorithm 3.1
 			round++
@@ -201,39 +203,49 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 }
 
 // classify returns any rule triggered upon receipt of the last message.
-func classify(d Defs, instance, process int64, msgs []Msg, last Msg) uponRule {
+func classify(d Defs, instance, round, process int64, msgs []Msg, msg Msg) (uponRule, bool) {
 	// TODO(corver): Figure out how to handle out of sync round messages...
-	switch last.Type {
+	switch msg.Type {
 	case MsgPrePrepare:
-		if justifyPrePrepare(d, instance, msgs, last) {
-			return uponValidPrePrepare
+		if msg.Round != round {
+			return uponUnknown, false
+		}
+		if justifyPrePrepare(d, instance, msgs, msg) {
+			return uponValidPrePrepare, true
 		}
 	case MsgPrepare:
-		prepareCount := countByRoundAndValue(msgs, MsgPrepare, last.Round, last.Value)
+		if msg.Round != round {
+			return uponUnknown, false
+		}
+		prepareCount := countByRoundAndValue(msgs, MsgPrepare, msg.Round, msg.Value)
 		if prepareCount == d.Quorum {
-			return uponQuorumPrepare
+			return uponQuorumPrepare, true
 		}
 	case MsgCommit:
-		commitCount := countByRoundAndValue(msgs, MsgCommit, last.Round, last.Value)
+		commitCount := countByRoundAndValue(msgs, MsgCommit, msg.Round, msg.Value)
 		if commitCount == d.Quorum {
-			return uponQuorumCommit
+			// TODO(corver): Ensure no round check is ok.
+			return uponQuorumCommit, true
 		}
 	case MsgRoundChange:
-		changeCount := countByRound(msgs, MsgRoundChange, last.Round)
-		if changeCount == d.Faulty+1 {
-			return uponMinRoundChange
+		changeCount := countByRound(msgs, MsgRoundChange, msg.Round)
+		if msg.Round > round && changeCount == d.Faulty+1 {
+			return uponMinRoundChange, true
 		}
 
-		if changeCount == d.Quorum &&
-			d.IsLeader(instance, last.Round, process) &&
-			justifyRoundChange(d, msgs, last) {
-			return uponQuorumRoundChange
+		if msg.Round == round &&
+			changeCount == d.Quorum &&
+			d.IsLeader(instance, msg.Round, process) &&
+			justifyRoundChange(d, msgs, msg) {
+			return uponQuorumRoundChange, true
 		}
+
+		return uponUnknown, false
 	default:
 		panic("bug: invalid type")
 	}
 
-	return uponUnknown
+	return uponUnknown, false
 }
 
 func highestPrepared(qrc []Msg) (int64, []byte) { // Algorithm 4.5
@@ -273,13 +285,13 @@ func getMinRound(d Defs, msgs []Msg, round int64) int64 { // Algorithm 3.6
 		if count < d.Faulty+1 {
 			continue
 		}
-		if rmin > round {
+		if rmin < round {
 			continue
 		}
 		rmin = round
 	}
 
-	if rmin <= round {
+	if rmin == int64(math.MaxInt64) || rmin <= round {
 		panic("bug: no rmin")
 	}
 
