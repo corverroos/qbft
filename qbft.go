@@ -30,6 +30,8 @@ type Defs struct {
 	NewTimer func(round int64) (<-chan time.Time, func())
 	// IsValid validates messages.
 	IsValid func(instance int64, msg Msg) bool
+	// LogUponRule allows debug logging of triggered upon rules on message receipt.
+	LogUponRule func(instance, process int64, msg Msg, uponRule string)
 	// Quorum is the quorum count for the system.
 	Quorum int
 	// Faulty is the maximum faulty process count for the system.
@@ -58,6 +60,8 @@ type Msg struct {
 	PreparedRound int64
 	PreparedValue []byte
 }
+
+//go:generate stringer -type=uponRule -trimprefix=upon
 
 // uponRule defines the event based rules that are triggered when messages are received.
 type uponRule int64
@@ -138,6 +142,13 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 			}
 
 			msgs = append(msgs, msg)
+
+			rule := classify(d, instance, process, msgs, msg)
+			if rule == uponUnknown {
+				continue
+			}
+
+			d.LogUponRule(instance, process, msg, rule.String())
 
 			switch classify(d, instance, process, msgs, msg) {
 			case uponValidPrePrepare: // Algorithm 2.1
