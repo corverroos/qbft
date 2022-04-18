@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/corverroos/qbft"
+	"math/rand"
 	"testing"
 	"time"
 )
@@ -67,6 +68,9 @@ func TestHappy(t *testing.T) {
 		case msg := <-broadcast:
 			for _, out := range receives {
 				out <- msg
+				if rand.Float64() < 0.1 { // Send 10% messages twice
+					out <- msg
+				}
 			}
 		case result := <-resultChan:
 			results = append(results, result)

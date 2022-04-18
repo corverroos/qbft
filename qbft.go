@@ -105,10 +105,11 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 	// === State ===
 
 	var (
-		round         int64  = 1
-		preparedRound int64  = 0
-		preparedValue []byte = nil
+		round         int64 = 1
+		preparedRound int64
+		preparedValue []byte
 		msgs          []Msg
+		dedup         = make(map[dedupKey]bool)
 		timerChan     <-chan time.Time
 		stopTimer     func()
 	)
@@ -127,6 +128,11 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 	for {
 		select {
 		case msg := <-t.Receive:
+			if dedup[key(msg)] {
+				continue
+			}
+			dedup[key(msg)] = true
+
 			if !d.IsValid(instance, msg) {
 				continue
 			}
@@ -398,4 +404,17 @@ func filterMsgs(msgs []Msg, typ MsgType, round *int64, value *[]byte, pr *int64,
 	}
 
 	return resp
+}
+
+func key(msg Msg) dedupKey {
+	return dedupKey{
+		Source: msg.Source,
+		Type:   msg.Type,
+	}
+}
+
+// dedupKey provides the key to dedups received messages.
+type dedupKey struct {
+	Source int64
+	Type   MsgType
 }
