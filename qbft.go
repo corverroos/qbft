@@ -272,27 +272,26 @@ func highestPrepared(qrc []Msg) (int64, []byte) { // Algorithm 4.5
 }
 
 func getMinRound(d Defs, msgs []Msg, round int64) int64 { // Algorithm 3.6
-	counts := make(map[int64]int) // map[round]count
+	// Get all RoundChange messages with round (rj) higher than current round (ri)
+	var frc []Msg
 	for _, msg := range filterMsgs(msgs, MsgRoundChange, nil, nil, nil, nil) {
 		if msg.Round <= round {
 			continue
 		}
-		counts[msg.Round]++
+		frc = append(frc, msg)
 	}
 
+	// Sanity check
+	if len(frc) < d.Faulty+1 {
+		panic("bug: too few round change messages")
+	}
+
+	// Get the smallest round in the set.
 	rmin := int64(math.MaxInt64)
-	for round, count := range counts {
-		if count < d.Faulty+1 {
-			continue
+	for _, msg := range frc {
+		if rmin > msg.Round {
+			rmin = msg.Round
 		}
-		if rmin < round {
-			continue
-		}
-		rmin = round
-	}
-
-	if rmin == int64(math.MaxInt64) || rmin <= round {
-		panic("bug: no rmin")
 	}
 
 	return rmin
