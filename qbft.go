@@ -168,7 +168,7 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 				return msg.Value, nil
 
 			case uponMinRoundChange: // Algorithm 3.5
-				round = getMinRound(d, msgs, round)
+				round = nextRound(d, msgs, round)
 
 				stopTimer()
 				timerChan, stopTimer = d.NewTimer(round)
@@ -271,7 +271,7 @@ func highestPrepared(qrc []Msg) (int64, []byte) { // Algorithm 4.5
 	return pr, pv
 }
 
-func getMinRound(d Defs, msgs []Msg, round int64) int64 { // Algorithm 3.6
+func nextRound(d Defs, msgs []Msg, round int64) int64 { // Algorithm 3.6
 	// Get all RoundChange messages with round (rj) higher than current round (ri)
 	var frc []Msg
 	for _, msg := range filterMsgs(msgs, MsgRoundChange, nil, nil, nil, nil) {
@@ -432,11 +432,13 @@ func key(msg Msg) dedupKey {
 	return dedupKey{
 		Source: msg.Source,
 		Type:   msg.Type,
+		Round:  msg.Round,
 	}
 }
 
-// dedupKey provides the key to dedups received messages.
+// dedupKey provides the key to dedup received messages.
 type dedupKey struct {
 	Source int64
 	Type   MsgType
+	Round  int64
 }
