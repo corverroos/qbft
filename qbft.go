@@ -120,7 +120,7 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 
 	// === Algrithm ===
 
-	{ // Algorithm 1.11
+	{ // Algorithm 1:11
 		if d.IsLeader(instance, round, process) {
 			broadcastMsg(MsgPrePrepare, round, inputValue)
 		}
@@ -151,23 +151,23 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 			d.LogUponRule(instance, process, round, msg, rule.String())
 
 			switch rule {
-			case uponValidPrePrepare: // Algorithm 2.1
+			case uponValidPrePrepare: // Algorithm 2:1
 				stopTimer()
 				timerChan, stopTimer = d.NewTimer(round)
 
 				broadcastMsg(MsgPrepare, msg.Round, msg.Value)
 
-			case uponQuorumPrepare: // Algorithm 2.4
+			case uponQuorumPrepare: // Algorithm 2:4
 				preparedRound = msg.Round
 				preparedValue = msg.Value
 				broadcastMsg(MsgCommit, msg.Round, msg.Value)
 
-			case uponQuorumCommit: // Algorithm 2.8
+			case uponQuorumCommit: // Algorithm 2:8
 				stopTimer()
 
 				return msg.Value, nil
 
-			case uponMinRoundChange: // Algorithm 3.5
+			case uponMinRoundChange: // Algorithm 3:5
 				round = nextRound(d, msgs, round)
 
 				stopTimer()
@@ -175,7 +175,7 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 
 				broadcastRoundChange(round, preparedRound, preparedValue)
 
-			case uponQuorumRoundChange: // Algorithm 3.11
+			case uponQuorumRoundChange: // Algorithm 3:11
 				qrc := filterRoundChange(msgs, msg.Round)
 				_, pv := highestPrepared(qrc)
 
@@ -188,7 +188,7 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 			default:
 				panic("bug: invalid rule")
 			}
-		case <-timerChan: // Algorithm 3.1
+		case <-timerChan: // Algorithm 3:1
 			round++
 
 			stopTimer()
@@ -248,14 +248,14 @@ func classify(d Defs, instance, round, process int64, msgs []Msg, msg Msg) (upon
 	return uponUnknown, false
 }
 
-func highestPrepared(qrc []Msg) (int64, []byte) { // Algorithm 4.5
+// highestPrepared implements algorithm 4:5 and returns
+// the highest prepared round (and pv) from the set of quorum
+// round change messages (Qrc).
+func highestPrepared(qrc []Msg) (int64, []byte) {
 	if len(qrc) == 0 {
 		// Expect: len(Qrc) >= quorum
 		panic("bug: qrc empty")
 	}
-
-	// ⊲ Helper function that returns a tuple (pr, pv) where pr and pv are, respectively, the prepared round
-	// and the prepared value of the ROUND-CHANGE message in Qrc with the highest prepared round
 
 	var (
 		pr int64
@@ -271,7 +271,9 @@ func highestPrepared(qrc []Msg) (int64, []byte) { // Algorithm 4.5
 	return pr, pv
 }
 
-func nextRound(d Defs, msgs []Msg, round int64) int64 { // Algorithm 3.6
+// nextRound implements algorithm 3:6 and returns the next minimum round
+// from received round change messages.
+func nextRound(d Defs, msgs []Msg, round int64) int64 {
 	// Get all RoundChange messages with round (rj) higher than current round (ri)
 	var frc []Msg
 	for _, msg := range filterMsgs(msgs, MsgRoundChange, nil, nil, nil, nil) {
@@ -297,7 +299,9 @@ func nextRound(d Defs, msgs []Msg, round int64) int64 { // Algorithm 3.6
 	return rmin
 }
 
-func justifyRoundChange(d Defs, msgs []Msg, msg Msg) bool { // Algorithm 4.1
+// justifyRoundChange implements algorithm 4:1 and returns true
+// if the latest round change message was justified.
+func justifyRoundChange(d Defs, msgs []Msg, msg Msg) bool {
 	if msg.Type != MsgRoundChange {
 		panic("bug: not a round change message")
 	}
@@ -319,7 +323,9 @@ func justifyRoundChange(d Defs, msgs []Msg, msg Msg) bool { // Algorithm 4.1
 	return true
 }
 
-func justifyPrePrepare(d Defs, instance int64, msgs []Msg, msg Msg) bool { // Algorithm 4.3
+// justifyPrePrepare implements algorithm 4:3 and returns true if latest
+// preprepare message is justified.
+func justifyPrePrepare(d Defs, instance int64, msgs []Msg, msg Msg) bool {
 	if msg.Type != MsgPrePrepare {
 		panic("bug: not d preprepare message")
 	}
@@ -328,36 +334,32 @@ func justifyPrePrepare(d Defs, instance int64, msgs []Msg, msg Msg) bool { // Al
 		return false
 	}
 
-	// predicate JustifyPrePrepare((PRE-PREPARE, λi, round, value))
-	{
-		// round = 1
-		if msg.Round == 1 {
-			return true
-		}
-	}
-	{
-		qrc := filterRoundChange(msgs, msg.Round)
-		if len(qrc) < d.Quorum {
-			return false
-		}
-
-		if qrcNoPrepared(qrc) {
-			return true
-		}
-
-		pv, ok := qrcHighestPrepared(d, msgs, qrc)
-		if !ok {
-			return false
-		} else if !bytes.Equal(pv, msg.Value) {
-			return false
-		}
-
+	if msg.Round == 1 {
 		return true
 	}
+
+	qrc := filterRoundChange(msgs, msg.Round)
+	if len(qrc) < d.Quorum {
+		return false
+	}
+
+	if qrcNoPrepared(qrc) {
+		return true
+	}
+
+	pv, ok := qrcHighestPrepared(d, msgs, qrc)
+	if !ok {
+		return false
+	} else if !bytes.Equal(pv, msg.Value) {
+		return false
+	}
+
+	return true
 }
 
-func qrcNoPrepared(qrc []Msg) bool { // Condition J1
-	// ∀(ROUND-CHANGE, λi , round, prj , pvj) ∈ Qrc : prj = ⊥ ∧ prj = ⊥
+// qrcNoPrepared implements condition J1 and returns true if all
+// quorom round changes messages (Qrc) have no prepared round or value.
+func qrcNoPrepared(qrc []Msg) bool {
 	for _, msg := range qrc {
 		if msg.Type != MsgRoundChange {
 			panic("bug: invalid Qrc set")
@@ -369,7 +371,9 @@ func qrcNoPrepared(qrc []Msg) bool { // Condition J1
 	return true
 }
 
-func qrcHighestPrepared(d Defs, all []Msg, qrc []Msg) ([]byte, bool) { // Condition J2
+// qrcHighestPrepared implements condition J2 and returns true (and pv) if
+// quorum prepare messages with highest pv was received.
+func qrcHighestPrepared(d Defs, all []Msg, qrc []Msg) ([]byte, bool) {
 	pr, pv := highestPrepared(qrc)
 	if pr == 0 {
 		return nil, false
@@ -382,42 +386,42 @@ func qrcHighestPrepared(d Defs, all []Msg, qrc []Msg) ([]byte, bool) { // Condit
 	return pv, true
 }
 
+// countByRound returns the number of messages matching the type and round.
 func countByRound(msgs []Msg, typ MsgType, round int64) int {
 	return len(filterMsgs(msgs, typ, &round, nil, nil, nil))
 }
 
+// countByRoundAndValue returns the number of messages matching the type, round and value.
 func countByRoundAndValue(msgs []Msg, typ MsgType, round int64, value []byte) int {
 	return len(filterMsgs(msgs, typ, &round, &value, nil, nil))
 }
 
+// filterRoundChange returns all round change messages for the provided round.
 func filterRoundChange(msgs []Msg, round int64) []Msg {
 	return filterMsgs(msgs, MsgRoundChange, &round, nil, nil, nil)
 }
 
+// filterMsgs returns a subset of messages matching the provided type
+// and the optional round, value, pr, pv.
 func filterMsgs(msgs []Msg, typ MsgType, round *int64, value *[]byte, pr *int64, pv *[]byte) []Msg {
 	var resp []Msg
 	for _, msg := range msgs {
-		// Check type
 		if typ != msg.Type {
 			continue
 		}
 
-		// Check round
 		if round != nil && *round != msg.Round {
 			continue
 		}
 
-		// Check value
 		if value != nil && !bytes.Equal(*value, msg.Value) {
 			continue
 		}
 
-		// Check prepared value
 		if pv != nil && !bytes.Equal(*pv, msg.PreparedValue) {
 			continue
 		}
 
-		// Check prepared value
 		if pr != nil && *pr != msg.PreparedRound {
 			continue
 		}
@@ -428,6 +432,7 @@ func filterMsgs(msgs []Msg, typ MsgType, round *int64, value *[]byte, pr *int64,
 	return resp
 }
 
+// key returns the message dedup key.
 func key(msg Msg) dedupKey {
 	return dedupKey{
 		Source: msg.Source,

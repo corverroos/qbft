@@ -11,5 +11,6 @@ as referenced by the [QBFT spec](https://github.com/ConsenSys/qbft-formal-spec-a
 
 ## TODO
 
- - [] Test round change
- - [] Double check future/past round messages
+ - Double check future/past round messages.
+ - Double check if rules need to trigger on round change.
+ - Add Byzantium tests.
