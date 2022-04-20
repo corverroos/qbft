@@ -6,11 +6,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 )
 
 // Transport abstracts the transport layer between processes in the consensus system.
+//
+// Note that broadcasting doesn't return an error. Since this algorithm is idempotent
+// it is suggested to just retry broadcasting indefinitely until it succeeds or times out.
 type Transport struct {
 	// Broadcast sends the message to all other
 	// processes in the system (including this process).
@@ -76,10 +80,18 @@ const (
 )
 
 // Run returns the consensus decided value (Qcommit) or a context closed error.
-func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inputValue []byte) ([]byte, error) {
+func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inputValue []byte) (value []byte, err error) {
 	if inputValue == nil {
 		return nil, errors.New("nil input value not supported")
 	}
+	defer func() {
+		// Errors are unexpected since this algorithm doesn't do IO
+		// or have other sources of errors. Panics are used for sanity
+		// checks to improve readability. Catch them here.
+		if r := recover(); r != nil {
+			err = fmt.Errorf("qbft sanity check: %v", r)
+		}
+	}()
 
 	// === Helpers ==
 
