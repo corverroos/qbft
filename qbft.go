@@ -168,7 +168,7 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 				return msg.Value, nil
 
 			case uponMinRoundChange: // Algorithm 3:5
-				round = nextRound(d, msgs, round)
+				round = nextMinRound(d, msgs, round)
 
 				stopTimer()
 				timerChan, stopTimer = d.NewTimer(round)
@@ -204,7 +204,6 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 
 // classify returns any rule triggered upon receipt of the last message.
 func classify(d Defs, instance, round, process int64, msgs []Msg, msg Msg) (uponRule, bool) {
-	// TODO(corver): Figure out how to handle out of sync round messages...
 	switch msg.Type {
 	case MsgPrePrepare:
 		if msg.Round != round {
@@ -214,29 +213,26 @@ func classify(d Defs, instance, round, process int64, msgs []Msg, msg Msg) (upon
 			return uponValidPrePrepare, true
 		}
 	case MsgPrepare:
-		if msg.Round != round {
-			return uponUnknown, false
-		}
-		prepareCount := countByRoundAndValue(msgs, MsgPrepare, msg.Round, msg.Value)
+		prepareCount := countByValue(msgs, MsgPrepare, msg.Value)
 		if prepareCount == d.Quorum {
 			return uponQuorumPrepare, true
 		}
 	case MsgCommit:
-		commitCount := countByRoundAndValue(msgs, MsgCommit, msg.Round, msg.Value)
+		commitCount := countByValue(msgs, MsgCommit, msg.Value)
 		if commitCount == d.Quorum {
-			// TODO(corver): Ensure no round check is ok.
 			return uponQuorumCommit, true
 		}
 	case MsgRoundChange:
-		changeCount := countByRound(msgs, MsgRoundChange, msg.Round)
-		if msg.Round > round && changeCount == d.Faulty+1 {
+		frc := filterHigherRoundChange(msgs, round)
+		if msg.Round > round && len(frc) == d.Faulty+1 {
 			return uponMinRoundChange, true
 		}
 
+		qrc := filterRoundChange(msgs, round)
 		if msg.Round == round &&
-			changeCount == d.Quorum &&
+			len(qrc) == d.Quorum &&
 			d.IsLeader(instance, msg.Round, process) &&
-			justifyRoundChange(d, msgs, msg) {
+			justifyRoundChange(d, msgs, qrc) {
 			return uponQuorumRoundChange, true
 		}
 
@@ -271,17 +267,11 @@ func highestPrepared(qrc []Msg) (int64, []byte) {
 	return pr, pv
 }
 
-// nextRound implements algorithm 3:6 and returns the next minimum round
+// nextMinRound implements algorithm 3:6 and returns the next minimum round
 // from received round change messages.
-func nextRound(d Defs, msgs []Msg, round int64) int64 {
+func nextMinRound(d Defs, msgs []Msg, round int64) int64 {
 	// Get all RoundChange messages with round (rj) higher than current round (ri)
-	var frc []Msg
-	for _, msg := range filterMsgs(msgs, MsgRoundChange, nil, nil, nil, nil) {
-		if msg.Round <= round {
-			continue
-		}
-		frc = append(frc, msg)
-	}
+	frc := filterHigherRoundChange(msgs, round)
 
 	// Sanity check
 	if len(frc) < d.Faulty+1 {
@@ -301,12 +291,7 @@ func nextRound(d Defs, msgs []Msg, round int64) int64 {
 
 // justifyRoundChange implements algorithm 4:1 and returns true
 // if the latest round change message was justified.
-func justifyRoundChange(d Defs, msgs []Msg, msg Msg) bool {
-	if msg.Type != MsgRoundChange {
-		panic("bug: not a round change message")
-	}
-
-	qrc := filterRoundChange(msgs, msg.Round)
+func justifyRoundChange(d Defs, all, qrc []Msg) bool {
 	if len(qrc) < d.Quorum {
 		return false
 	}
@@ -315,7 +300,7 @@ func justifyRoundChange(d Defs, msgs []Msg, msg Msg) bool {
 		return true
 	}
 
-	_, ok := qrcHighestPrepared(d, msgs, qrc)
+	_, ok := qrcHighestPrepared(d, all, qrc)
 	if !ok {
 		return false
 	}
@@ -379,26 +364,33 @@ func qrcHighestPrepared(d Defs, all []Msg, qrc []Msg) ([]byte, bool) {
 		return nil, false
 	}
 
-	if countByRoundAndValue(all, MsgPrepare, pr, pv) < d.Quorum {
+	if countByValue(all, MsgPrepare, pv) < d.Quorum {
 		return nil, false
 	}
 
 	return pv, true
 }
 
-// countByRound returns the number of messages matching the type and round.
-func countByRound(msgs []Msg, typ MsgType, round int64) int {
-	return len(filterMsgs(msgs, typ, &round, nil, nil, nil))
-}
-
-// countByRoundAndValue returns the number of messages matching the type, round and value.
-func countByRoundAndValue(msgs []Msg, typ MsgType, round int64, value []byte) int {
-	return len(filterMsgs(msgs, typ, &round, &value, nil, nil))
+// countByValue returns the number of messages matching the type and value.
+func countByValue(msgs []Msg, typ MsgType, value []byte) int {
+	return len(filterMsgs(msgs, typ, nil, &value, nil, nil))
 }
 
 // filterRoundChange returns all round change messages for the provided round.
 func filterRoundChange(msgs []Msg, round int64) []Msg {
 	return filterMsgs(msgs, MsgRoundChange, &round, nil, nil, nil)
+}
+
+// filterHigherRoundChange returns the all round change messages with round higher than the provided round.
+func filterHigherRoundChange(msgs []Msg, round int64) []Msg {
+	var resp []Msg
+	for _, msg := range filterMsgs(msgs, MsgRoundChange, nil, nil, nil, nil) {
+		if msg.Round <= round {
+			continue
+		}
+		resp = append(resp, msg)
+	}
+	return resp
 }
 
 // filterMsgs returns a subset of messages matching the provided type

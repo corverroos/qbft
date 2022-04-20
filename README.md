@@ -6,8 +6,11 @@ as referenced by the [QBFT spec](https://github.com/ConsenSys/qbft-formal-spec-a
 ## Features
 
 - Simple API, just a single function: `qbft.Run`.
+- Consensus on arbitrary data.
 - Transport abstracted and not provided.
+- Decoupled from process authentication and message signing (not provided).
 - No dependencies.
+- Core algorithm under 500 lines of code.
 
 ## TODO
 
