@@ -405,10 +405,13 @@ func filterHigherRoundChange(msgs []Msg, round int64) []Msg {
 	return resp
 }
 
-// filterMsgs returns a subset of messages matching the provided type
+// filterMsgs returns the first message per process matching the provided type
 // and the optional round, value, pr, pv.
 func filterMsgs(msgs []Msg, typ MsgType, round *int64, value *[]byte, pr *int64, pv *[]byte) []Msg {
-	var resp []Msg
+	var (
+		resp []Msg
+		dups = make(map[int64]bool)
+	)
 	for _, msg := range msgs {
 		if typ != msg.Type {
 			continue
@@ -430,6 +433,11 @@ func filterMsgs(msgs []Msg, typ MsgType, round *int64, value *[]byte, pr *int64,
 			continue
 		}
 
+		if dups[msg.Source] {
+			continue
+		}
+
+		dups[msg.Source] = true
 		resp = append(resp, msg)
 	}
 
