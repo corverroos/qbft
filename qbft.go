@@ -56,6 +56,7 @@ const (
 
 // Msg defines the inter process messages.
 type Msg struct {
+	UUID          string
 	Type          MsgType
 	Instance      int64
 	Source        int64
@@ -63,6 +64,8 @@ type Msg struct {
 	Value         []byte
 	PreparedRound int64
 	PreparedValue []byte
+
+	RawMsg [][]byte
 }
 
 //go:generate stringer -type=uponRule -trimprefix=upon
@@ -130,14 +133,14 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 		stopTimer     func()
 	)
 
-	// === Algrithm ===
+	// === Algorithm ===
 
 	{ // Algorithm 1:11
-		if d.IsLeader(instance, round, process) {
-			broadcastMsg(MsgPrePrepare, round, inputValue)
+		if d.IsLeader(instance, 1, process) {
+			broadcastMsg(MsgPrePrepare, 1, inputValue)
 		}
 
-		timerChan, stopTimer = d.NewTimer(round)
+		timerChan, stopTimer = d.NewTimer(1)
 	}
 
 	// Handle events until finished.
@@ -218,31 +221,34 @@ func Run(ctx context.Context, d Defs, t Transport, instance, process int64, inpu
 func classify(d Defs, instance, round, process int64, msgs []Msg, msg Msg) (uponRule, bool) {
 	switch msg.Type {
 	case MsgPrePrepare:
-		if msg.Round != round {
+		if msg.Round < round {
 			return uponUnknown, false
 		}
 		if justifyPrePrepare(d, instance, msgs, msg) {
 			return uponValidPrePrepare, true
 		}
 	case MsgPrepare:
-		prepareCount := countByValue(msgs, MsgPrepare, msg.Value)
-		if prepareCount == d.Quorum {
+		if msg.Round != round {
+			return uponUnknown, false
+		}
+		prepareCount := countByValue(msgs, MsgPrepare, msg.Round, msg.Value)
+		if prepareCount >= d.Quorum {
 			return uponQuorumPrepare, true
 		}
 	case MsgCommit:
-		commitCount := countByValue(msgs, MsgCommit, msg.Value)
-		if commitCount == d.Quorum {
+		commitCount := countByValue(msgs, MsgCommit, msg.Round, msg.Value)
+		if commitCount == /*(>=)*/ d.Quorum {
 			return uponQuorumCommit, true
 		}
 	case MsgRoundChange:
 		frc := filterHigherRoundChange(msgs, round)
-		if msg.Round > round && len(frc) == d.Faulty+1 {
+		if /*msg.Round > round && */ len(frc) == d.Faulty+1 {
 			return uponMinRoundChange, true
 		}
 
 		qrc := filterRoundChange(msgs, round)
 		if msg.Round == round &&
-			len(qrc) == d.Quorum &&
+			len(qrc) /*==*/ >= d.Quorum &&
 			d.IsLeader(instance, msg.Round, process) &&
 			justifyRoundChange(d, msgs, qrc) {
 			return uponQuorumRoundChange, true
@@ -355,7 +361,7 @@ func justifyPrePrepare(d Defs, instance int64, msgs []Msg, msg Msg) bool {
 }
 
 // qrcNoPrepared implements condition J1 and returns true if all
-// quorom round changes messages (Qrc) have no prepared round or value.
+// quorum round changes messages (Qrc) have no prepared round or value.
 func qrcNoPrepared(qrc []Msg) bool {
 	for _, msg := range qrc {
 		if msg.Type != MsgRoundChange {
